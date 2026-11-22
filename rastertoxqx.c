@@ -2,7 +2,7 @@
 
 GENERAL
 This program converts CUPS raster data to Zenographics XQX/ZjStream format
-for driving HP LaserJet P1005/P1006/P1007/P1008 printers on macOS.
+for driving HP LaserJet P1005/P1006/P1007/P1008/P1505 printers on macOS.
 
 It replaces the Ghostscript-based pipeline (gs | foo2xqx), eliminating
 the Ghostscript dependency entirely. CUPS's built-in cgpdftoraster
@@ -29,8 +29,10 @@ your option) any later version.
 #include <unistd.h>
 #include <stdarg.h>
 #include <time.h>
+#include <math.h>
 #include <cups/cups.h>
 #include <cups/raster.h>
+#include <cups/sidechannel.h>
 #include "jbig.h"
 #include "xqx.h"
 
@@ -425,6 +427,108 @@ end_doc(FILE *fp)
 }
 
 /*
+ * Firmware handling
+ *
+ * These printers lose their firmware on every power-off. Once firmware is
+ * loaded, the IEEE-1284 device ID contains "FWVER:". Before sending a job we
+ * ask the USB backend for the device ID over the CUPS side channel; if the
+ * firmware is missing we send it first and wait until the printer reports it.
+ * This makes the first job after power-on print instead of being discarded.
+ */
+#define FIRMWARE_DIR	"/Library/Printers/foo2xqx/firmware"
+
+static int
+get_device_id(char *buf, int size)
+{
+    int			len = size - 1;
+    cups_sc_status_t	status;
+
+    status = cupsSideChannelDoRequest(CUPS_SC_CMD_GET_DEVICE_ID, buf, &len, 5.0);
+    if (status != CUPS_SC_STATUS_OK || len <= 0)
+	return 0;
+    buf[len] = '\0';
+    return 1;
+}
+
+static const char *
+firmware_for_model(const char *devid)
+{
+    /* Mapping from foo2zjs's hplj1000 hotplug script */
+    if (strstr(devid, "LaserJet P1505"))	return "sihpP1505.dl";
+    if (strstr(devid, "LaserJet P1005"))	return "sihpP1005.dl";
+    if (strstr(devid, "LaserJet P1007"))	return "sihpP1005.dl";
+    if (strstr(devid, "LaserJet P1006"))	return "sihpP1006.dl";
+    if (strstr(devid, "LaserJet P1008"))	return "sihpP1006.dl";
+    return NULL;
+}
+
+static void
+ensure_firmware(FILE *ofp)
+{
+    char	devid[1024];
+    char	path[256];
+    const char	*fw;
+    FILE	*fp;
+    char	buf[16384];
+    size_t	n, total = 0;
+    int		i, dlen;
+
+    if (!get_device_id(devid, sizeof(devid)))
+    {
+	fprintf(stderr, "DEBUG: rastertoxqx: no device ID via side channel, "
+		"skipping firmware check\n");
+	return;
+    }
+    fprintf(stderr, "DEBUG: rastertoxqx: device ID: %s\n", devid);
+
+    if (strstr(devid, "FWVER:"))
+	return;				/* firmware already loaded */
+
+    fw = firmware_for_model(devid);
+    if (!fw)
+    {
+	fprintf(stderr, "DEBUG: rastertoxqx: unknown model, no firmware sent\n");
+	return;
+    }
+    snprintf(path, sizeof(path), "%s/%s", FIRMWARE_DIR, fw);
+    if (!(fp = fopen(path, "rb")))
+    {
+	fprintf(stderr, "WARNING: rastertoxqx: printer needs firmware but "
+		"%s cannot be read\n", path);
+	return;
+    }
+
+    fprintf(stderr, "INFO: Sending printer firmware...\n");
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0)
+    {
+	fwrite(buf, 1, n, ofp);
+	total += n;
+    }
+    fclose(fp);
+    fflush(ofp);
+    fprintf(stderr, "DEBUG: rastertoxqx: sent %zu bytes of %s\n", total, fw);
+
+    /* Wait for the backend to push it out, then for the printer to boot */
+    dlen = 0;
+    cupsSideChannelDoRequest(CUPS_SC_CMD_DRAIN_OUTPUT, buf, &dlen, 60.0);
+
+    fprintf(stderr, "INFO: Waiting for printer to load firmware...\n");
+    for (i = 0; i < 30; i++)
+    {
+	sleep(1);
+	if (get_device_id(devid, sizeof(devid)) && strstr(devid, "FWVER:"))
+	{
+	    fprintf(stderr, "DEBUG: rastertoxqx: firmware loaded after %ds\n",
+		    i + 1);
+	    sleep(1);
+	    return;
+	}
+    }
+    fprintf(stderr, "WARNING: rastertoxqx: printer did not report firmware "
+	    "version after 30s, sending job anyway\n");
+}
+
+/*
  * Map PPD page size name to XQX paper code
  */
 static int
@@ -476,27 +580,107 @@ source_code_from_position(unsigned position)
 }
 
 /*
+ * Halftoning: 8bpp grayscale -> 1bpp
+ *
+ * A laser can't reliably print isolated 1/1200" dots (they come out
+ * grainy and much too dark), so grays are rendered with a clustered-dot
+ * 45-degree "round dot" screen of ~106 lpi (cell vectors (4,4)/(4,-4) at
+ * 600 dpi). At 1200x600 the threshold matrix is built on the full device
+ * grid, so dots grow in 1/1200" steps -> 64 gray levels per cell.
+ * Chosen by comparing printed test sheets on a P1505.
+ *
+ * A tone curve compensates for dot gain (toner spread): it lightens
+ * shadows and midtones so dark steps don't merge into black, while 100%
+ * black stays solid so text keeps full contrast.
+ */
+#define SCREEN_PERIOD	4		/* cell vector in 600-dpi pixels */
+
+static unsigned char	*Screen = NULL;	/* threshold tile, 1..254 */
+static int		ScreenW, ScreenH, ScreenXScale;
+static unsigned char	ToneLUT[256];	/* darkness -> corrected darkness */
+
+typedef struct { int idx; double val; } screen_rank_t;
+
+static int
+screen_rank_cmp(const void *a, const void *b)
+{
+    const screen_rank_t *ra = a, *rb = b;
+
+    if (ra->val > rb->val) return -1;
+    if (ra->val < rb->val) return 1;
+    return ra->idx - rb->idx;
+}
+
+static void
+build_screen(int xscale)
+{
+    int			p = SCREEN_PERIOD, x, y, k, n;
+    screen_rank_t	*r;
+    static const double	cx[] = { 0, .10, .25, .50, .75, .90, .97, 1 };
+    static const double	cy[] = { 0, .08, .19, .38, .60, .76, .88, 1 };
+
+    if (Screen && ScreenXScale == xscale)
+	return;
+    free(Screen);
+
+    ScreenXScale = xscale;
+    ScreenW = 2 * p * xscale;
+    ScreenH = 2 * p;
+    n = ScreenW * ScreenH;
+    Screen = malloc(n);
+    r = malloc(n * sizeof(screen_rank_t));
+    if (!Screen || !r)
+	error(1, "ERROR: rastertoxqx: Cannot allocate screen\n");
+
+    /* Spot function: high at cell centres, which turn black first */
+    for (y = 0; y < ScreenH; y++)
+	for (x = 0; x < ScreenW; x++)
+	{
+	    double X = (x + 0.5) / xscale, Y = y + 0.5;
+	    double u = (X + Y) / (2.0 * p), v = (X - Y) / (2.0 * p);
+
+	    r[y * ScreenW + x].idx = y * ScreenW + x;
+	    r[y * ScreenW + x].val = cos(2 * M_PI * u) + cos(2 * M_PI * v)
+				     + 1e-9 * ((x * 7 + y * 13) % 17);
+	}
+    qsort(r, n, sizeof(screen_rank_t), screen_rank_cmp);
+    for (k = 0; k < n; k++)
+	Screen[r[k].idx] = (unsigned char)((k + 0.5) * 255.0 / n);
+    free(r);
+
+    /* Tone curve (piecewise linear through measured-by-eye points) */
+    for (k = 0; k < 256; k++)
+    {
+	double	d = k / 255.0, t;
+	int	i = 0;
+
+	while (i < 6 && d > cx[i + 1])
+	    i++;
+	t = (d - cx[i]) / (cx[i + 1] - cx[i]);
+	ToneLUT[k] = (unsigned char)(255 * (cy[i] + t * (cy[i + 1] - cy[i])) + 0.5);
+    }
+}
+
+/*
  * Convert an 8bpp grayscale scanline to 1bpp packed bitmap.
  *
- * CUPS_CSPACE_W (luminance): 0=black, 255=white
- * CUPS_CSPACE_K (black ink):  0=white, 255=black
- * PBM convention:             0=white, 1=black
+ * CUPS_CSPACE_W/SW (luminance): 0=black, 255=white
+ * CUPS_CSPACE_K (black ink):     0=white, 255=black
+ * PBM convention:                0=white, 1=black
  */
 static void
-threshold_line(const unsigned char *src, unsigned char *dst,
-	       unsigned width, cups_cspace_t cs)
+halftone_line(const unsigned char *src, unsigned char *dst,
+	      unsigned width, unsigned y, cups_cspace_t cs)
 {
-    unsigned	x;
-    unsigned char byte = 0;
+    unsigned		x;
+    unsigned char	byte = 0;
+    const unsigned char	*row = Screen + (y % ScreenH) * ScreenW;
+    int			lum = (cs == CUPS_CSPACE_W || cs == CUPS_CSPACE_SW);
 
     for (x = 0; x < width; x++)
     {
-	int is_black;
-
-	if (cs == CUPS_CSPACE_W || cs == CUPS_CSPACE_SW)
-	    is_black = (src[x] < 128);
-	else
-	    is_black = (src[x] >= 128);
+	int d = ToneLUT[lum ? 255 - src[x] : src[x]];
+	int is_black = (d == 255) || (d > row[x % ScreenW]);
 
 	if (is_black)
 	    byte |= (0x80 >> (x & 7));
@@ -545,6 +729,7 @@ main(int argc, char *argv[])
 	return 1;
     }
 
+    ensure_firmware(stdout);
     start_doc(stdout);
 
     while (cupsRasterReadHeader2(ras, &header))
@@ -607,9 +792,10 @@ main(int argc, char *argv[])
 	else if (header.cupsBitsPerPixel == 8)
 	{
 	    /*
-	     * 8bpp grayscale (W or K): threshold to 1-bpp.
+	     * 8bpp grayscale (W or K): halftone to 1-bpp.
 	     */
 	    unsigned char *line = malloc(header.cupsBytesPerLine);
+	    build_screen(header.HWResolution[0] >= 1200 ? 2 : 1);
 	    if (!line)
 	    {
 		fprintf(stderr, "ERROR: rastertoxqx: Cannot allocate "
@@ -620,8 +806,8 @@ main(int argc, char *argv[])
 	    for (y = 0; y < h; y++)
 	    {
 		cupsRasterReadPixels(ras, line, header.cupsBytesPerLine);
-		threshold_line(line, buf + (size_t)y * bpl16, w,
-			       header.cupsColorSpace);
+		halftone_line(line, buf + (size_t)y * bpl16, w, y,
+			      header.cupsColorSpace);
 	    }
 	    free(line);
 	}

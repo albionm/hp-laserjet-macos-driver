@@ -14,7 +14,7 @@
 *cupsVersion:	1.0
 *cupsManualCopies: True
 *cupsModelNumber:  2
-*cupsFilter:	"application/vnd.cups-raster 0 rastertoxqx"
+*cupsFilter:	"application/vnd.cups-raster 0 /Library/Printers/foo2xqx/filter/rastertoxqx"
 *ModelName:     "HP LaserJet P1007"
 *ShortNickName: "HP LaserJet P1007 rastertoxqx"
 *NickName:      "HP LaserJet P1007 rastertoxqx (ARM64 native)"
@@ -90,6 +90,13 @@
 *Resolution 600x600dpi/600x600 dpi: "<</HWResolution[600 600]>>setpagedevice"
 *Resolution 1200x600dpi/1200x600 dpi: "<</HWResolution[1200 600]>>setpagedevice"
 *CloseUI: *Resolution
+
+*% 8-bit gray raster: rastertoxqx does its own laser-friendly halftoning
+*OpenUI *ColorModel/Color Mode: PickOne
+*OrderDependency: 10 AnySetup *ColorModel
+*DefaultColorModel: Gray
+*ColorModel Gray/Grayscale: "<</cupsColorOrder 0/cupsColorSpace 18/cupsBitsPerColor 8>>setpagedevice"
+*CloseUI: *ColorModel
 
 *OpenUI *InputSlot/Media Source: PickOne
 *OrderDependency: 150 AnySetup *InputSlot
