@@ -48,6 +48,16 @@ Grey areas and photos are halftoned by `rastertoxqx` itself with a 45° clustere
 
 Large grey areas may still darken slightly toward their bottom edge. That's toner drag inside the printer; a coarser screen reduces it at the cost of detail (`SCREEN_PERIOD` in `rastertoxqx.c`).
 
+## Two-sided printing (P1505)
+
+The P1505 has no duplex unit, but it supports HP's manual duplex, and the driver offers it as **Two-Sided** in the print dialog (Long-Edge or Short-Edge binding):
+
+1. The printer prints all front sides and then pauses (blinking light).
+2. Take the printed stack and put it back into the input tray **printed side down, with the top edge of the pages going into the printer first**.
+3. Press the printer's button. It prints the back sides.
+
+With several copies, all fronts are printed first, so you only turn the stack over once per job. Odd page counts get a blank last page. The driver sends all front sides first, then the back sides in reverse order, with the printer's pause flag on the first back side. The same scheme as foo2xqx, but with the back-side rotation verified on a real P1505: long-edge backs are sent as-is, short-edge backs rotated 180°.
+
 ## Troubleshooting
 
 Check the CUPS log with `tail -f /var/log/cups/error_log`. The firmware messages are informational, so they only appear with debug logging enabled (`cupsctl --debug-logging`; turn it off again with `cupsctl --no-debug-logging`).

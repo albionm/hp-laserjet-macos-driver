@@ -53,6 +53,8 @@ static int	PageNum = 0;
 static int	RealWidth;
 static int	OutputStartPlane = 1;
 static int	SaveToner = 0;
+static int	Duplex = 0;		/* manual duplex requested */
+static long	PauseOff = -1;		/* offset of DUPLEX_PAUSE value in page */
 
 static long JbgOptions[5] =
 {
@@ -231,10 +233,10 @@ start_page(BIE_CHAIN **root, FILE *ofp)
 	    | ((long) current->data[10] <<  8)
 	    | (long) current->data[11]);
 
-    nitems = 15;
+    nitems = Duplex ? 16 : 15;
 
     chunk_write(XQX_START_PAGE, nitems, ofp);
-    item_uint32_write(0x80000000, 180, ofp);
+    item_uint32_write(0x80000000, Duplex ? 192 : 180, ofp);
     item_uint32_write(0x20000005,              1,              ofp);
     item_uint32_write(XQXI_DMDEFAULTSOURCE,     SourceCode,     ofp);
     item_uint32_write(XQXI_DMMEDIATYPE,         MediaCode,      ofp);
@@ -249,6 +251,12 @@ start_page(BIE_CHAIN **root, FILE *ofp)
     item_uint32_write(XQXI_VIDEO_X,             RealWidth / Bpp,ofp);
     item_uint32_write(XQXI_VIDEO_Y,             h,              ofp);
     item_uint32_write(XQXI_ECONOMODE,           EconoMode,      ofp);
+    if (Duplex)
+    {
+	/* Value is patched when the page is emitted (see emit_page) */
+	PauseOff = ftell(ofp) + sizeof(XQX_ITEM_HEADER);
+	item_uint32_write(XQXI_DUPLEX_PAUSE,    0,              ofp);
+    }
     item_uint32_write(XQXI_DMPAPER,             PaperCode,      ofp);
     item_uint32_write(XQXI_END,                 0xdeadbeef,     ofp);
 
@@ -411,7 +419,7 @@ start_doc(FILE *fp)
     item_uint32_write(0x80000000,	84,			fp);
     item_uint32_write(0x10000005,	1,			fp);
     item_uint32_write(0x10000001,	0,			fp);
-    item_uint32_write(XQXI_DMDUPLEX,	0,			fp);
+    item_uint32_write(XQXI_DMDUPLEX,	Duplex ? 2 : 0,		fp);
     item_uint32_write(0x10000000,	0,			fp);
     item_uint32_write(0x10000003,	1,			fp);
     item_uint32_write(XQXI_END,		0xdeadbeef,		fp);
@@ -696,6 +704,107 @@ halftone_line(const unsigned char *src, unsigned char *dst,
 }
 
 /*
+ * Manual duplex
+ *
+ * The P1505 has no duplex unit; HP's manual duplex is part of the XQX
+ * protocol (same scheme as foo2xqx): all front sides are sent first, then
+ * the back sides in reverse order. The first back side carries
+ * DUPLEX_PAUSE=2, so the printer stops and waits until the user has put
+ * the printed stack back into the tray and pressed the button.
+ *
+ * Orientation: the user puts the printed stack back into the input tray
+ * printed side down, top edge of the pages first. On the P1505 the back
+ * sides then come out right for long-edge binding as-is, so only
+ * short-edge binding is rotated 180 degrees (tested on a real P1505).
+ *
+ * Pages are JBIG-compressed into memory and emitted at the end of the job.
+ */
+typedef struct
+{
+    char	*data;
+    size_t	len;
+    long	pause_off;
+} XQX_PAGE;
+
+typedef struct
+{
+    XQX_PAGE	*pages;
+    int		n, cap;
+} PAGE_LIST;
+
+static XQX_PAGE
+compress_page(unsigned char *buf, int w, int h)
+{
+    XQX_PAGE	pg = { NULL, 0, -1 };
+    FILE	*mfp = open_memstream(&pg.data, &pg.len);
+
+    if (!mfp)
+	error(1, "ERROR: rastertoxqx: Cannot create page buffer\n");
+    PauseOff = -1;
+    pbm_page(buf, w, h, mfp);
+    pg.pause_off = PauseOff;
+    fclose(mfp);
+    if (pg.pause_off < 0 || pg.pause_off + 4 > (long) pg.len)
+	error(1, "ERROR: rastertoxqx: duplex page without pause item\n");
+    return pg;
+}
+
+static void
+list_add(PAGE_LIST *l, XQX_PAGE pg)
+{
+    if (l->n == l->cap)
+    {
+	l->cap = l->cap ? 2 * l->cap : 16;
+	l->pages = realloc(l->pages, l->cap * sizeof(XQX_PAGE));
+	if (!l->pages)
+	    error(1, "ERROR: rastertoxqx: Cannot allocate page list\n");
+    }
+    l->pages[l->n++] = pg;
+}
+
+static void
+emit_page(XQX_PAGE *pg, DWORD pause, FILE *ofp)
+{
+    DWORD	v = be32(pause);
+
+    memcpy(pg->data + pg->pause_off, &v, sizeof(v));
+    if (fwrite(pg->data, 1, pg->len, ofp) != pg->len)
+	error(1, "ERROR: rastertoxqx: write failed\n");
+}
+
+/* Rotate a 1-bpp bitmap (rows of bpl16 bytes, w valid pixels) by 180 deg */
+static void
+rotate_180(unsigned char *buf, unsigned w, unsigned h, unsigned bpl16)
+{
+    unsigned char	*tmp = calloc(bpl16, h);
+    unsigned		x, y;
+
+    if (!tmp)
+	error(1, "ERROR: rastertoxqx: Cannot allocate rotation buffer\n");
+    for (y = 0; y < h; y++)
+    {
+	const unsigned char	*src = buf + (size_t) y * bpl16;
+	unsigned char		*dst = tmp + (size_t) (h - 1 - y) * bpl16;
+
+	for (x = 0; x < w; x++)
+	{
+	    if (!src[x >> 3])		/* skip white bytes quickly */
+	    {
+		x |= 7;
+		continue;
+	    }
+	    if (src[x >> 3] & (0x80 >> (x & 7)))
+	    {
+		unsigned nx = w - 1 - x;
+		dst[nx >> 3] |= 0x80 >> (nx & 7);
+	    }
+	}
+    }
+    memcpy(buf, tmp, (size_t) bpl16 * h);
+    free(tmp);
+}
+
+/*
  * Main — CUPS raster filter
  *
  * Usage: rastertoxqx job-id user title copies options [filename]
@@ -709,6 +818,10 @@ main(int argc, char *argv[])
     cups_raster_t	*ras;
     cups_page_header2_t	header;
     unsigned		y;
+    int			doc_started = 0;
+    int			long_edge = 0, dup_copies = 1, doc_page = 0;
+    unsigned		last_w = 0, last_h = 0;
+    PAGE_LIST		odd = { 0 }, even = { 0 };
 
     if (argc < 6 || argc > 7)
     {
@@ -730,7 +843,6 @@ main(int argc, char *argv[])
     }
 
     ensure_firmware(stdout);
-    start_doc(stdout);
 
     while (cupsRasterReadHeader2(ras, &header))
     {
@@ -756,6 +868,19 @@ main(int argc, char *argv[])
 	PaperCode  = paper_code_from_name(header.cupsPageSizeName);
 	MediaCode  = media_code_from_name(header.MediaType);
 	SourceCode = source_code_from_position(header.MediaPosition);
+
+	if (!doc_started)
+	{
+	    /* The document header needs to know about duplex */
+	    Duplex = header.Duplex ? 1 : 0;
+	    long_edge = !header.Tumble;
+	    dup_copies = (header.NumCopies > 0) ? header.NumCopies : 1;
+	    start_doc(stdout);
+	    doc_started = 1;
+	    if (Duplex)
+		fprintf(stderr, "INFO: Manual two-sided printing (%s edge)\n",
+			long_edge ? "long" : "short");
+	}
 
 	debug(1, "Page: %ux%u px, %ux%u dpi, bpp=%d cs=%d, "
 	      "paper=%d media=%d\n",
@@ -831,6 +956,24 @@ main(int argc, char *argv[])
 	    continue;
 	}
 
+	if (Duplex)
+	{
+	    /* Buffer: odd pages are fronts, even pages are backs */
+	    ++doc_page;
+	    if ((doc_page & 1) == 0)
+	    {
+		if (!long_edge)
+		    rotate_180(buf, w, h, bpl16);
+		list_add(&even, compress_page(buf, w, h));
+	    }
+	    else
+		list_add(&odd, compress_page(buf, w, h));
+	    last_w = w;
+	    last_h = h;
+	    free(buf);
+	    continue;
+	}
+
 	/*
 	 * Send the page (possibly multiple copies).
 	 * pbm_page does not modify buf unless SaveToner is on.
@@ -843,6 +986,62 @@ main(int argc, char *argv[])
 	}
 
 	free(buf);
+    }
+
+    if (!doc_started)
+	start_doc(stdout);
+
+    if (Duplex && odd.n > 0)
+    {
+	/*
+	 * Fronts of all copies, then all backs in reverse order. Each copy
+	 * with an odd page count gets a blank back page. One flip per job.
+	 */
+	XQX_PAGE	blank = { NULL, 0, -1 };
+	int		c, i, first = 1;
+
+	if (odd.n > even.n)
+	{
+	    unsigned	bpl16 = (((last_w + 7) / 8) + 15) & ~15;
+	    unsigned char *zero = calloc(bpl16, last_h);
+
+	    if (!zero)
+		error(1, "ERROR: rastertoxqx: Cannot allocate blank page\n");
+	    blank = compress_page(zero, last_w, last_h);
+	    free(zero);
+	}
+
+	for (c = 0; c < dup_copies; c++)
+	    for (i = 0; i < odd.n; i++, PageNum++)
+	    {
+		emit_page(&odd.pages[i], first ? 0 : 1, stdout);
+		first = 0;
+	    }
+
+	fprintf(stderr, "INFO: After the front sides: put the stack back "
+		"into the tray printed side down, top edge first, and press "
+		"the printer's button\n");
+
+	first = 1;
+	for (c = dup_copies - 1; c >= 0; c--)
+	{
+	    if (blank.data)
+	    {
+		emit_page(&blank, first ? 2 : 3, stdout);
+		first = 0;
+	    }
+	    for (i = even.n - 1; i >= 0; i--, PageNum++)
+	    {
+		emit_page(&even.pages[i], first ? 2 : 3, stdout);
+		first = 0;
+	    }
+	}
+
+	for (i = 0; i < odd.n; i++)  free(odd.pages[i].data);
+	for (i = 0; i < even.n; i++) free(even.pages[i].data);
+	free(odd.pages);
+	free(even.pages);
+	free(blank.data);
     }
 
     end_doc(stdout);

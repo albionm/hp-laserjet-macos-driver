@@ -98,6 +98,15 @@
 *ColorModel Gray/Grayscale: "<</cupsColorOrder 0/cupsColorSpace 18/cupsBitsPerColor 8>>setpagedevice"
 *CloseUI: *ColorModel
 
+*% Manual duplex: fronts first, printer pauses, user reinserts the stack
+*OpenUI *Duplex/Two-Sided (manual): PickOne
+*OrderDependency: 50 AnySetup *Duplex
+*DefaultDuplex: None
+*Duplex None/Off: "<</Duplex false>>setpagedevice"
+*Duplex DuplexNoTumble/Long-Edge Binding: "<</Duplex true/Tumble false>>setpagedevice"
+*Duplex DuplexTumble/Short-Edge Binding: "<</Duplex true/Tumble true>>setpagedevice"
+*CloseUI: *Duplex
+
 *OpenUI *InputSlot/Media Source: PickOne
 *OrderDependency: 150 AnySetup *InputSlot
 *DefaultInputSlot: Auto
